@@ -421,7 +421,7 @@ static void test_table_read_write_seek_index(void)
 	test_table_read_write_seek(1, GIT_SHA1_FORMAT_ID);
 }
 
-static void test_table_refs_for(int indexed)
+static void test_table_refs_for(int indexed, int peeled)
 {
 	int N = 50;
 	char **want_names = reftable_calloc(sizeof(char *) * (N + 1));
@@ -446,6 +446,7 @@ static void test_table_refs_for(int indexed)
 	int j;
 
 	set_test_hash(want_hash, 4);
+	reftable_writer_set_limits(w, 100, 200);
 
 	for (i = 0; i < N; i++) {
 		uint8_t hash[GIT_SHA1_RAWSZ];
@@ -464,9 +465,15 @@ static void test_table_refs_for(int indexed)
 
 		set_test_hash(hash1, i / 4);
 		set_test_hash(hash2, 3 + i / 4);
-		ref.value_type = REFTABLE_REF_VAL2;
-		ref.value.val2.value = hash1;
-		ref.value.val2.target_value = hash2;
+		ref.update_index = 150;
+		if (peeled) {
+			ref.value_type = REFTABLE_REF_VAL2;
+			ref.value.val2.value = hash1;
+			ref.value.val2.target_value = hash2;
+		} else {
+			ref.value_type = REFTABLE_REF_VAL1;
+			ref.value.val1 = hash1;
+		}
 
 		/* 80 bytes / entry, so 3 entries per block. Yields 17
 		 */
@@ -475,7 +482,7 @@ static void test_table_refs_for(int indexed)
 		EXPECT(n == 0);
 
 		if (!memcmp(hash1, want_hash, GIT_SHA1_RAWSZ) ||
-		    !memcmp(hash2, want_hash, GIT_SHA1_RAWSZ)) {
+		    (peeled && !memcmp(hash2, want_hash, GIT_SHA1_RAWSZ))) {
 			want_names[want_names_len++] = xstrdup(name);
 		}
 	}
@@ -511,6 +518,7 @@ static void test_table_refs_for(int indexed)
 
 		EXPECT(j < want_names_len);
 		EXPECT(0 == strcmp(ref.refname, want_names[j]));
+		EXPECT(ref.update_index == 150);
 		j++;
 		reftable_ref_record_release(&ref);
 	}
@@ -524,12 +532,14 @@ static void test_table_refs_for(int indexed)
 
 static void test_table_refs_for_no_index(void)
 {
-	test_table_refs_for(0);
+	test_table_refs_for(0, 0);
+	test_table_refs_for(0, 1);
 }
 
 static void test_table_refs_for_obj_index(void)
 {
-	test_table_refs_for(1);
+	test_table_refs_for(1, 0);
+	test_table_refs_for(1, 1);
 }
 
 static void test_write_empty_table(void)

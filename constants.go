@@ -35,3 +35,14 @@ const blockTypeObj = 'o'
 const blockTypeAny = 0
 
 const maxRestarts = (1 << 16) - 1
+
+// maxDeflateRatio is the theoretical maximum expansion of a DEFLATE stream.
+// Used to reject log blocks whose declared decompressed size cannot possibly
+// be produced by the compressed bytes actually present.
+const maxDeflateRatio = 1032
+
+// maxIndexDepth bounds how many index levels a seek will descend. Offsets in
+// index records are file-supplied and can form a cycle; a valid tree is only
+// a few levels deep because each level holds strictly fewer blocks than the
+// one below it.
+const maxIndexDepth = 64

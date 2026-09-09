@@ -12,12 +12,12 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"log"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"time"
 )
@@ -79,6 +79,21 @@ func (st *Stack) String() string {
 	return fmt.Sprintf("%v", nms)
 }
 
+// validateTableName rejects manifest entries that would escape the reftable
+// directory. Storage implementations join these names onto a base directory,
+// and filepath.Join cleans "..", so an unvalidated name from tables.list can
+// address — and Remove — arbitrary files. Table names are always plain
+// filenames, so refusing separators and dot components is sufficient.
+func validateTableName(name string) error {
+	if name == "" || name == "." || name == ".." {
+		return fmt.Errorf("%w: invalid table name %q", fmtError, name)
+	}
+	if strings.ContainsAny(name, `/\`) || strings.Contains(name, "\x00") {
+		return fmt.Errorf("%w: table name %q must be a plain filename", fmtError, name)
+	}
+	return nil
+}
+
 func (st *Stack) readNames() ([]string, error) {
 	bs, err := st.storage.OpenBlockSource(listFileName)
 	if errors.Is(err, os.ErrNotExist) {
@@ -91,22 +106,20 @@ func (st *Stack) readNames() ([]string, error) {
 
 	data, err := bs.ReadBlock(0, int(bs.Size()))
 	if err != nil {
-		log.Printf("err %v %s %d", err, data, bs.Size())
-		return nil, err
-	}
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
-	}
-	if err != nil {
 		return nil, err
 	}
 	lines := bytes.Split(data, []byte("\n"))
 
 	var res []string
 	for _, l := range lines {
-		if len(l) > 0 {
-			res = append(res, string(l))
+		if len(l) == 0 {
+			continue
 		}
+		name := string(l)
+		if err := validateTableName(name); err != nil {
+			return nil, err
+		}
+		res = append(res, name)
 	}
 
 	return res, nil
@@ -146,14 +159,16 @@ func (st *Stack) reloadOnce(names []string, reuseOpen bool) error {
 		cur[r.Name()] = r
 	}
 
-	var newTables []*Reader
+	var newTables, opened []*Reader
+	retained := make(map[string]bool, len(names))
 	defer func() {
-		for _, t := range newTables {
+		for _, t := range opened {
 			t.Close()
 		}
 	}()
 
 	for _, name := range names {
+		retained[name] = true
 		rd := cur[name]
 		if reuseOpen && rd != nil {
 			delete(cur, name)
@@ -165,21 +180,36 @@ func (st *Stack) reloadOnce(names []string, reuseOpen bool) error {
 
 			rd, err = NewReader(bs, name)
 			if err != nil {
-				return fmt.Errorf("NewReader(%s): %v", name, err)
+				bs.Close()
+				return fmt.Errorf("NewReader(%s): %w", name, err)
 			}
+			opened = append(opened, rd)
 		}
 		newTables = append(newTables, rd)
 	}
 
-	// success. Swap.
+	var tabs []Table
+	for _, r := range newTables {
+		tabs = append(tabs, r)
+	}
+	merged, err := NewMerged(tabs, st.cfg.HashID)
+	if err != nil {
+		return err
+	}
+	merged.suppressDeletions = true
+
+	// Only transfer ownership once the entire replacement is valid.
 	st.stack = newTables
-	newTables = nil
+	st.merged = merged
+	opened = nil
 	for _, old := range cur {
 		old.Close()
 
 		// On windows, we may only be able to close after
 		// closing file handles.
-		st.storage.Remove(old.Name())
+		if !retained[old.Name()] {
+			st.storage.Remove(old.Name())
+		}
 	}
 	return nil
 }
@@ -199,7 +229,7 @@ func (st *Stack) reload(reuseOpen bool) error {
 		}
 		err = st.reloadOnce(names, reuseOpen)
 		if err == nil {
-			break
+			return nil
 		}
 		if !errors.Is(err, os.ErrNotExist) {
 			return err
@@ -214,27 +244,62 @@ func (st *Stack) reload(reuseOpen bool) error {
 		}
 
 		// compaction changed names; back off and retry.
-		delay = 2*delay + time.Millisecond*time.Duration(1+rand.Intn(2))
+		delay = 2*delay + time.Millisecond*time.Duration(1+rand.IntN(2))
 		time.Sleep(delay)
 	}
 
-	var tabs []Table
-	for _, r := range st.stack {
-		tabs = append(tabs, r)
-	}
-
-	m, err := NewMerged(tabs, st.cfg.HashID)
-	if err != nil {
-		return err
-	}
-	m.suppressDeletions = true
-	st.merged = m
-	return nil
+	return ErrReloadTimeout
 }
 
-// ErrLockFailure is returned for failed writes. On a failed write,
-// the stack is reloaded, so the transaction may be retried.
+// ErrLockFailure means a write could not proceed before publishing its
+// manifest, for example because a lock was contended or the stack was stale.
+// Callers may retry the transaction when errors.Is(err, ErrLockFailure).
+// Errors after publication never match this sentinel.
 var ErrLockFailure = errors.New("reftable: lock failure")
+
+// ErrReloadTimeout means no consistent stack snapshot could be loaded before
+// the reload deadline. It does not mean that a preceding write was aborted.
+var ErrReloadTimeout = errors.New("reftable: stack reload timed out")
+
+// ErrPostCommit means the manifest was published, but durability confirmation,
+// reloading, or maintenance failed afterward. Do not replay the transaction.
+// Use errors.As to inspect the Cause of the accompanying *PostCommitError.
+var ErrPostCommit = errors.New("reftable: error after manifest publication")
+
+// PostCommitError reports a failure after a manifest was published. The update
+// is visible, though durability may be uncertain and the Stack may still hold
+// its previous snapshot. Reopen the stack to inspect the current state; do not
+// blindly retry the write.
+//
+// Cause is deliberately not part of the Unwrap chain: a lock error during
+// post-commit maintenance must not classify a committed write as retryable.
+// Callers can inspect it explicitly with errors.Is or errors.As after checking
+// the publication status.
+type PostCommitError struct {
+	Cause error
+}
+
+func (e *PostCommitError) Error() string {
+	return fmt.Sprintf("%v: %v", ErrPostCommit, e.Cause)
+}
+
+func (e *PostCommitError) Unwrap() error { return ErrPostCommit }
+
+func postCommitError(err error) error {
+	if err == nil {
+		return nil
+	}
+	// errors.As, not a type assertion: callers reach here through
+	// errors.Join and fmt.Errorf("%w", ...), so the PostCommitError is
+	// frequently wrapped rather than the top-level value. A bare assertion
+	// misses those and wraps a second time, and the whole point of this type
+	// is that a committed write is not reclassified as retryable.
+	var pce *PostCommitError
+	if errors.As(err, &pce) {
+		return err
+	}
+	return &PostCommitError{Cause: err}
+}
 
 func (st *Stack) UpToDate() (bool, error) {
 	names, err := st.readNames()
@@ -254,32 +319,41 @@ func (st *Stack) UpToDate() (bool, error) {
 	return true, nil
 }
 
-// Add a new reftable to stack, transactionally.
+// Add a new reftable to stack, transactionally. ErrPostCommit means the update
+// was published but a later step failed; the callback must not be replayed.
 func (st *Stack) Add(write func(w *Writer) error) error {
-	if err := st.add(write); err != nil {
-		if err == ErrLockFailure {
+	published, err := st.add(write)
+	if err != nil {
+		if errors.Is(err, ErrLockFailure) {
 			st.reload(true)
 		}
 		return err
 	}
 
 	if !st.disableAutoCompact {
-		return st.AutoCompact()
+		err = st.AutoCompact()
+		if published {
+			// The addition committed, even if maintenance cannot lock or
+			// reload the stack. Do not advertise a retryable write failure.
+			return postCommitError(err)
+		}
+		return err
 	}
 	return nil
 }
 
-func (st *Stack) add(write func(w *Writer) error) error {
+func (st *Stack) add(write func(w *Writer) error) (bool, error) {
 	tr, err := st.NewAddition()
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer tr.Close()
 	if err := tr.Add(write); err != nil {
-		return err
+		return false, err
 	}
 
-	return tr.Commit()
+	err = tr.Commit()
+	return tr.lockFile.Committed(), err
 }
 
 // Addition is a transaction that adds new tables to the top of the
@@ -360,6 +434,12 @@ func (tr *Addition) Add(write func(w *Writer) error) error {
 	}
 
 	if err := tab.Commit(); err != nil {
+		// The table rename may have succeeded before directory sync failed.
+		// It is not in the manifest yet, so remove it explicitly: Close must
+		// preserve published files, and this one is not tracked by tr yet.
+		if tab.Committed() {
+			return errors.Join(err, tr.stack.storage.Remove(dest))
+		}
 		return err
 	}
 
@@ -374,10 +454,12 @@ func (tr *Addition) Close() {
 	for _, nm := range tr.newTables {
 		tr.stack.storage.Remove(nm)
 	}
+	tr.newTables = nil
 	tr.lockFile.Close()
 }
 
-// Commit commits the changes to the database, releasing the lock.
+// Commit commits the changes to the database, releasing the lock. It returns
+// ErrPostCommit if the manifest was published but a subsequent step failed.
 func (tr *Addition) Commit() error {
 	if len(tr.newTables) == 0 {
 		// Nothing to be done.
@@ -389,13 +471,15 @@ func (tr *Addition) Commit() error {
 		return err
 	}
 
-	if err := tr.lockFile.Commit(); err != nil {
+	err := tr.lockFile.Commit()
+	if err != nil && !tr.lockFile.Committed() {
 		tr.Close()
 		return err
 	}
+	// Rename may succeed even when the following directory sync fails.
+	// Published tables belong to the manifest and must survive cleanup.
 	tr.newTables = nil
-
-	return tr.stack.reload(true)
+	return postCommitError(errors.Join(err, tr.stack.reload(true)))
 }
 
 func (s *Stack) checkAddition(tabname string) error {
@@ -408,7 +492,8 @@ func (s *Stack) checkAddition(tabname string) error {
 	}
 	r, err := NewReader(bs, tabname)
 	if err != nil {
-		return err
+		bs.Close()
+		return fmt.Errorf("NewReader(%s): %w", tabname, err)
 	}
 	defer r.Close()
 	it, err := r.SeekRef("")
@@ -432,11 +517,14 @@ func (s *Stack) checkAddition(tabname string) error {
 	return validateRefRecordAddition(s.Merged(), recs)
 }
 
-// non-deterministic random generator.
-var randomRandom = rand.New(rand.NewSource(time.Now().UnixNano()))
-
+// formatName builds the filename for a table covering [min, max]. The random
+// suffix keeps names unique when several tables cover the same update-index
+// range. rand/v2's top-level source is safe for concurrent use, which matters
+// because one process commonly holds a Stack per repository and writes to them
+// from different goroutines; the old package-level *rand.Rand was not, and
+// torn reads produced duplicate names.
 func formatName(min, max uint64) string {
-	return fmt.Sprintf("0x%012x-0x%012x-%08x", min, max, randomRandom.Uint32())
+	return fmt.Sprintf("0x%012x-0x%012x-%08x", min, max, rand.Uint32())
 }
 
 // NextUpdateIndex returns the update index at which to write the next table.
@@ -567,7 +655,7 @@ func (st *Stack) compactRangeStats(first, last int, expiration *LogExpirationCon
 }
 
 func (st *Stack) compactRange(first, last int, expiration *LogExpirationConfig) (bool, error) {
-	if first >= last && expiration == nil {
+	if first > last || (first == last && expiration == nil) {
 		return true, nil
 	}
 	st.Stats.Attempts++
@@ -580,9 +668,7 @@ func (st *Stack) compactRange(first, last int, expiration *LogExpirationConfig) 
 		return false, err
 	}
 
-	defer func() {
-		lock.Close()
-	}()
+	defer lock.Close()
 
 	if ok, err := st.UpToDate(); !ok || err != nil {
 		return false, err
@@ -622,64 +708,77 @@ func (st *Stack) compactRange(first, last int, expiration *LogExpirationConfig) 
 	if err != nil {
 		return false, err
 	}
+	published := false
 	if tmpTable != nil {
-		defer tmpTable.Close()
+		defer func() {
+			if !published && tmpTable.Committed() {
+				st.storage.Remove(tmpTable.Name())
+			}
+			tmpTable.Close()
+		}()
 	}
 
 	lock, err = st.storage.LockForWrite(listFileName)
+	if errors.Is(err, os.ErrExist) {
+		return false, nil
+	}
 	if err != nil {
 		return false, err
 	}
-
 	defer lock.Close()
 
+	// Other writers can append or compact unrelated tables while the global
+	// lock is released. Replace only our still-contiguous range in the latest
+	// manifest, preserving every change outside it.
+	current, err := st.readNames()
+	if err != nil {
+		return false, err
+	}
+	if len(deleteOnSuccess) == 0 {
+		// Guaranteed by the first > last check above; keep the slice
+		// access below honest if that guard is ever relaxed.
+		return false, nil
+	}
+	start := slices.Index(current, deleteOnSuccess[0])
+	end := start + len(deleteOnSuccess)
+	if start < 0 || end > len(current) || !slices.Equal(current[start:end], deleteOnSuccess) {
+		return false, nil
+	}
+	var names []string
+	names = append(names, current[:start]...)
 	if tmpTable != nil {
 		if err := tmpTable.Commit(); err != nil {
 			return false, err
 		}
-	}
-
-	var names []string
-	for i := range first {
-		names = append(names, st.stack[i].name)
-	}
-
-	if tmpTable != nil {
 		names = append(names, tmpTable.Name())
 	}
-
-	for i := last + 1; i < len(st.stack); i++ {
-		names = append(names, st.stack[i].name)
-	}
+	names = append(names, current[end:]...)
 
 	if _, err := lock.Write([]byte(strings.Join(names, "\n"))); err != nil {
-		if tmpTable != nil {
-			os.Remove(tmpTable.Name())
-		}
 		return false, err
 	}
-	if err := lock.Commit(); err != nil {
-		if tmpTable != nil {
-			os.Remove(tmpTable.Name())
-		}
+	err = lock.Commit()
+	published = err == nil || lock.Committed()
+	if !published {
 		return false, err
 	}
 
-	for _, nm := range deleteOnSuccess {
-		if tmpTable != nil && nm != tmpTable.Name() {
-			// reflog expiry might cause us to reopen a
-			// new file with the same name.
-			os.Remove(nm)
+	// Reload closes and removes superseded tables through Storage. A sync
+	// failure after publication must not roll back the replacement table.
+	reloadErr := st.reload(expiration == nil)
+	if reloadErr != nil {
+		// reloadOnce never reached its cleanup, so the tables we just
+		// replaced are unreferenced by the manifest but still on disk.
+		// Nothing else collects them; drop them here.
+		for _, nm := range deleteOnSuccess {
+			if tmpTable != nil && nm == tmpTable.Name() {
+				// Reflog expiry can reuse the name we just published.
+				continue
+			}
+			st.storage.Remove(nm)
 		}
 	}
-
-	// If we expire log entries on a full compaction we write a
-	// table with the same the (min,max) update index, but we have
-	// to read from disk again.
-	if err := st.reload(expiration == nil); err != nil {
-		return true, fmt.Errorf("reload: %w", err)
-	}
-	return true, err
+	return true, postCommitError(errors.Join(err, reloadErr))
 }
 
 func (st *Stack) tableSizesForCompaction() []uint64 {
@@ -834,7 +933,8 @@ func (st *Stack) Clean() error {
 
 		rd, err := NewReader(bs, name)
 		if err != nil {
-			return fmt.Errorf("NewReader(%s): %v", name, err)
+			bs.Close()
+			return fmt.Errorf("NewReader(%s): %w", name, err)
 		}
 
 		cur := rd.MaxUpdateIndex()

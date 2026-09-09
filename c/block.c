@@ -13,6 +13,7 @@ https://developers.google.com/open-source/licenses/bsd
 #include "record.h"
 #include "reftable-error.h"
 #include "system.h"
+#include <limits.h>
 #include <zlib.h>
 
 int header_size(int version)
@@ -186,13 +187,22 @@ int block_reader_init(struct block_reader *br, struct reftable_block *block,
 		      int hash_size)
 {
 	uint32_t full_block_size = table_block_size;
-	uint8_t typ = block->data[header_off];
-	uint32_t sz = get_be24(block->data + header_off + 1);
+	uint8_t typ;
+	uint32_t sz;
 
 	uint16_t restart_count = 0;
 	uint32_t restart_start = 0;
 	uint8_t *restart_bytes = NULL;
+	uint32_t previous = 0;
+	int i;
 
+	if ((uint64_t)header_off + 4 > block->len)
+		return REFTABLE_FORMAT_ERROR;
+	typ = block->data[header_off];
+	sz = get_be24(block->data + header_off + 1);
+	if ((uint64_t)sz < (uint64_t)header_off + 6 ||
+	    (typ != BLOCK_TYPE_LOG && sz > block->len))
+		return REFTABLE_FORMAT_ERROR;
 	if (!reftable_is_block_type(typ))
 		return REFTABLE_FORMAT_ERROR;
 
@@ -216,8 +226,10 @@ int block_reader_init(struct block_reader *br, struct reftable_block *block,
 			return REFTABLE_ZLIB_ERROR;
 		}
 
-		if (dst_len + block_header_skip != sz)
+		if (dst_len + block_header_skip != sz) {
+			reftable_free(uncompressed);
 			return REFTABLE_FORMAT_ERROR;
+		}
 
 		/* We're done with the input data. */
 		reftable_block_done(block);
@@ -236,8 +248,17 @@ int block_reader_init(struct block_reader *br, struct reftable_block *block,
 	}
 
 	restart_count = get_be16(block->data + sz - 2);
+	if (2 + 3 * (uint32_t)restart_count > sz - header_off - 4)
+		return REFTABLE_FORMAT_ERROR;
 	restart_start = sz - 2 - 3 * restart_count;
 	restart_bytes = block->data + restart_start;
+	for (i = 0; i < restart_count; i++) {
+		uint32_t off = get_be24(restart_bytes + 3 * i);
+		if (off < header_off + 4 || off >= restart_start ||
+		    (i > 0 && off <= previous))
+			return REFTABLE_FORMAT_ERROR;
+		previous = off;
+	}
 
 	/* transfer ownership. */
 	br->block = *block;

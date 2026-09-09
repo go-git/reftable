@@ -113,8 +113,38 @@ static void test_block_read_write(void)
 	}
 }
 
+static void test_block_rejects_invalid_layout(void)
+{
+	uint8_t data[][10] = {
+		{ 'r', 0, 0, 0 },
+		{ 'r', 0, 0, 1 },
+		{ 'r', 255, 255, 255 },
+		{ 'r', 0, 0, 6, 255, 255 },
+		{ 'r', 0, 0, 10, 0, 0, 0, 0, 0, 1 },
+		{ 'r', 0, 0, 10, 0, 0, 0, 5, 0, 1 },
+		{ 'g', 0, 0, 1 },
+	};
+	int i;
+	for (i = 0; i < ARRAY_SIZE(data); i++) {
+		struct block_reader br = { 0 };
+		struct reftable_block block = {
+			.data = data[i],
+			.len = sizeof(data[i]),
+		};
+		int err = block_reader_init(&br, &block, 0, 0, GIT_SHA1_RAWSZ);
+		EXPECT(err == REFTABLE_FORMAT_ERROR);
+	}
+	for (i = 0; i < 4; i++) {
+		struct block_reader br = { 0 };
+		struct reftable_block block = { .data = data[0], .len = i };
+		int err = block_reader_init(&br, &block, 0, 0, GIT_SHA1_RAWSZ);
+		EXPECT(err == REFTABLE_FORMAT_ERROR);
+	}
+}
+
 int block_test_main(int argc, const char *argv[])
 {
 	RUN_TEST(test_block_read_write);
+	RUN_TEST(test_block_rejects_invalid_layout);
 	return 0;
 }

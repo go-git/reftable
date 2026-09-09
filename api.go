@@ -37,6 +37,9 @@ var SHA1ID = HashID([4]byte{'s', 'h', 'a', '1'})
 var SHA256ID = HashID([4]byte{'s', '2', '5', '6'})
 var NullHashID = HashID([4]byte{0, 0, 0, 0})
 
+// Size returns the hash size in bytes, or 0 if the ID is not one this
+// package knows. Callers must treat 0 as an error: the hash ID can come
+// straight out of a file header, so this must not panic.
 func (i HashID) Size() int {
 	switch i {
 	case NullHashID, SHA1ID:
@@ -44,7 +47,7 @@ func (i HashID) Size() int {
 	case SHA256ID:
 		return 32
 	}
-	panic("unknown hash")
+	return 0
 }
 
 // Table is a read interface for reftables, either file reftables or merged reftables.

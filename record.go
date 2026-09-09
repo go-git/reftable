@@ -184,7 +184,7 @@ func (r *RefRecord) decode(buf []byte, key string, valType uint8, hashSize int) 
 			return
 		}
 		buf = buf[s:]
-		if len(buf) < int(tsize) {
+		if uint64(len(buf)) < tsize {
 			return
 		}
 
@@ -329,6 +329,13 @@ func (r *objRecord) decode(buf []byte, prefix string, cnt3 uint8, hashSize int) 
 		return len(start) - len(buf), true
 	}
 
+	// count is file-supplied. Each offset costs at least one byte of varint,
+	// so it cannot exceed what is left in the block; without this a 10 byte
+	// varint reserves gigabytes.
+	if count > uint64(len(buf)) {
+		return
+	}
+
 	r.Offsets = make([]uint64, 1, count)
 	r.Offsets[0], n = getVarInt(buf)
 	if n <= 0 {
@@ -452,11 +459,14 @@ func decodeKey(buf []byte, prevKey string) (n int, key string, value uint8, ok b
 	value = uint8(suffixLen & 0x7)
 	suffixLen = suffixLen >> 3
 
-	if int(suffixLen) > len(buf) {
+	// Compare as uint64: these come from varints, and int(v) is negative for
+	// v >= 2^63, which would let the guards pass and make() take a negative
+	// or absurd length.
+	if suffixLen > uint64(len(buf)) {
 		return
 	}
 
-	if int(prefixLen) > len(prevKey) {
+	if prefixLen > uint64(len(prevKey)) {
 		return
 	}
 
@@ -582,7 +592,7 @@ func decodeString(buf []byte) (n int, val string, ok bool) {
 		return
 	}
 	buf = buf[s:]
-	if len(buf) < int(nameLen) {
+	if uint64(len(buf)) < nameLen {
 		return
 	}
 	val = string(buf[:nameLen])

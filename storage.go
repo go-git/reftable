@@ -10,11 +10,23 @@ import (
 )
 
 // AtomicWriter is an abstraction for a {write to temp, close, rename}
-// file sink.
+// file sink. Close aborts unpublished output and must be idempotent: a
+// second Close must not remove a path it no longer owns, because callers
+// legitimately Close the same writer twice on error paths.
 type AtomicWriter interface {
 	io.WriteCloser
+
+	// Name returns the basename this writer's output currently occupies:
+	// the temporary name before Commit, the final name after a successful
+	// one. It is stable across Close, so `Remove(w.Name())` after an
+	// aborted Close never addresses the final path.
 	Name() string
 	Commit() error
+
+	// Committed reports whether the new file has been published, i.e. the
+	// rename succeeded, even if Commit then returned a durability error.
+	// Close must not remove a published file. Note this is narrower than
+	// "the writer was closed": an aborted writer reports false.
 	Committed() bool
 }
 
@@ -36,28 +48,38 @@ type Storage interface {
 
 type fileWriter struct {
 	finalName string
+	tempName  string
+	committed bool
+	aborted   bool
 	*os.File
 }
 
 func (fw *fileWriter) Committed() bool {
-	return fw.File == nil
+	return fw.committed
 }
 
 func (fw *fileWriter) Name() string {
-	if fw.File != nil {
-		return filepath.Base(fw.File.Name())
+	if !fw.committed {
+		return filepath.Base(fw.tempName)
 	}
 
 	return filepath.Base(fw.finalName)
 }
 
 func (fw *fileWriter) Close() error {
-	if fw.File == nil {
-		return nil
+	var closeErr, removeErr error
+	if fw.File != nil {
+		closeErr = fw.File.Close()
+		fw.File = nil
 	}
-	err1 := fw.File.Close()
-	err2 := os.Remove(fw.File.Name())
-	return cmp.Or(err1, err2)
+	// Only the first Close of an unpublished writer owns the temp file. A
+	// second Close must not unlink the path again: another writer may have
+	// created it in the meantime, and removing it would steal their lock.
+	if !fw.committed && !fw.aborted {
+		fw.aborted = true
+		removeErr = os.Remove(fw.tempName)
+	}
+	return cmp.Or(closeErr, removeErr)
 }
 
 // fsyncDir flushes the directory entry for path.
@@ -71,19 +93,21 @@ func fsyncDir(path string) error {
 }
 
 func (fw *fileWriter) Commit() error {
+	if fw.File == nil {
+		return os.ErrClosed
+	}
 	if err := fw.File.Sync(); err != nil {
 		return err
 	}
-	if err := fw.File.Close(); err != nil {
-		return err
-	}
-
-	err := os.Rename(fw.File.Name(), fw.finalName)
+	err := fw.File.Close()
 	fw.File = nil
 	if err != nil {
 		return err
 	}
-
+	if err := os.Rename(fw.tempName, fw.finalName); err != nil {
+		return err
+	}
+	fw.committed = true
 	return fsyncDir(filepath.Dir(fw.finalName))
 }
 
@@ -92,7 +116,7 @@ func newLockForWrite(path string) (AtomicWriter, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &fileWriter{File: f, finalName: path}, nil
+	return &fileWriter{File: f, finalName: path, tempName: f.Name()}, nil
 }
 
 func newAtomicWriter(path string) (AtomicWriter, error) {
@@ -101,7 +125,7 @@ func newAtomicWriter(path string) (AtomicWriter, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &fileWriter{File: f, finalName: path}, nil
+	return &fileWriter{File: f, finalName: path, tempName: f.Name()}, nil
 }
 
 func NewLocalStorage(dir string) *localStorage {

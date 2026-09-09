@@ -11,6 +11,7 @@ https://developers.google.com/open-source/licenses/bsd
 #include "system.h"
 
 #include "reftable-reader.h"
+#include "reader.h"
 #include "merged.h"
 #include "basics.h"
 #include "constants.h"
@@ -356,6 +357,265 @@ static void test_reftable_stack_lock_failure(void)
 
 	reftable_stack_destroy(st);
 	clear_dir(dir);
+}
+
+/* Commit through a second stack on the first compaction read, after the
+ * compactor releases tables.list.lock. No sleeps or process scheduling needed. */
+struct addition_on_read {
+	struct reftable_block_source original;
+	struct reftable_stack *writer;
+	struct reftable_ref_record ref;
+	int fired;
+};
+
+static uint64_t addition_on_read_size(void *arg)
+{
+	struct addition_on_read *hook = arg;
+	return block_source_size(&hook->original);
+}
+
+static int addition_on_read_block(void *arg, struct reftable_block *dest,
+				 uint64_t off, uint32_t size)
+{
+	struct addition_on_read *hook = arg;
+	if (!hook->fired) {
+		int err;
+		hook->fired = 1;
+		err = reftable_stack_add(hook->writer, &write_test_ref, &hook->ref);
+		EXPECT_ERR(err);
+	}
+	return block_source_read_block(&hook->original, dest, off, size);
+}
+
+static void addition_on_read_return(void *arg, struct reftable_block *block)
+{
+	struct addition_on_read *hook = arg;
+	hook->original.ops->return_block(hook->original.arg, block);
+}
+
+static void addition_on_read_close(void *arg)
+{
+	struct addition_on_read *hook = arg;
+	block_source_close(&hook->original);
+}
+
+static struct reftable_block_source_vtable addition_on_read_ops = {
+	.size = addition_on_read_size,
+	.read_block = addition_on_read_block,
+	.return_block = addition_on_read_return,
+	.close = addition_on_read_close,
+};
+
+static void test_reftable_stack_compaction_preserves_addition(void)
+{
+	char *dir = get_tmp_dir(__LINE__);
+	struct reftable_write_options cfg = { 0 };
+	struct reftable_stack *compactor = NULL, *writer = NULL, *fresh = NULL;
+	struct reftable_ref_record ref = {
+		.refname = "refs/heads/a",
+		.update_index = 1,
+		.value_type = REFTABLE_REF_SYMREF,
+		.value.symref = "refs/heads/main",
+	};
+	struct reftable_ref_record got = { NULL };
+	struct addition_on_read hook = { 0 };
+	int err;
+
+	err = reftable_new_stack(&compactor, dir, cfg);
+	EXPECT_ERR(err);
+	compactor->disable_auto_compact = 1;
+	err = reftable_stack_add(compactor, &write_test_ref, &ref);
+	EXPECT_ERR(err);
+	ref.refname = "refs/heads/b";
+	ref.update_index = 2;
+	err = reftable_stack_add(compactor, &write_test_ref, &ref);
+	EXPECT_ERR(err);
+	err = reftable_new_stack(&writer, dir, cfg);
+	EXPECT_ERR(err);
+	writer->disable_auto_compact = 1;
+	ref.refname = "refs/heads/c";
+	ref.update_index = 3;
+	hook.original = compactor->readers[0]->source;
+	hook.writer = writer;
+	hook.ref = ref;
+	compactor->readers[0]->source.ops = &addition_on_read_ops;
+	compactor->readers[0]->source.arg = &hook;
+
+	err = reftable_stack_compact_all(compactor, NULL);
+	EXPECT_ERR(err);
+	EXPECT(hook.fired);
+	err = reftable_new_stack(&fresh, dir, cfg);
+	EXPECT_ERR(err);
+	err = reftable_stack_read_ref(fresh, "refs/heads/c", &got);
+	EXPECT_ERR(err);
+	EXPECT(got.update_index == 3);
+	reftable_ref_record_release(&got);
+	reftable_stack_destroy(fresh);
+	reftable_stack_destroy(writer);
+	reftable_stack_destroy(compactor);
+	clear_dir(dir);
+}
+
+static int compaction_read_failure(void *arg, struct reftable_block *dest,
+				   uint64_t off, uint32_t size)
+{
+	struct addition_on_read *hook = arg;
+	/* Let seek and initial iteration succeed, then fail at the third block. */
+	if (off >= 256) {
+		hook->fired = 1;
+		return REFTABLE_IO_ERROR;
+	}
+	return block_source_read_block(&hook->original, dest, off, size);
+}
+
+static int write_compaction_refs(struct reftable_writer *wr, void *arg)
+{
+	int count = *(int *)arg;
+	uint8_t oid[GIT_SHA1_RAWSZ] = { 1 };
+	int i;
+	reftable_writer_set_limits(wr, 1, 1);
+	for (i = 0; i < count; i++) {
+		char name[64];
+		struct reftable_ref_record ref = { NULL };
+		int err;
+		snprintf(name, sizeof(name), "refs/heads/branch%04d", i);
+		ref.refname = name;
+		ref.update_index = 1;
+		ref.value_type = REFTABLE_REF_VAL1;
+		ref.value.val1 = oid;
+		err = reftable_writer_add_ref(wr, &ref);
+		if (err)
+			return err;
+	}
+	return 0;
+}
+
+static void test_reftable_stack_compaction_preserves_read_error(void)
+{
+	char *dir = get_tmp_dir(__LINE__);
+	struct reftable_write_options cfg = { .block_size = 128 };
+	struct reftable_stack *st = NULL, *fresh = NULL;
+	struct reftable_log_expiry_config expiry = { 0 };
+	struct addition_on_read hook = { 0 };
+	struct reftable_block_source_vtable ops = addition_on_read_ops;
+	char **before = NULL, **after = NULL;
+	int count = 9, err, i;
+
+	err = reftable_new_stack(&st, dir, cfg);
+	EXPECT_ERR(err);
+	st->disable_auto_compact = 1;
+	err = reftable_stack_add(st, &write_compaction_refs, &count);
+	EXPECT_ERR(err);
+	/* Three data blocks without an index: the error occurs during iteration,
+	 * not during the initial seek that already propagates errors correctly. */
+	EXPECT(st->readers[0]->ref_offsets.index_offset == 0);
+	EXPECT(st->readers[0]->size > 256);
+	err = read_lines(st->list_file, &before);
+	EXPECT_ERR(err);
+	hook.original = st->readers[0]->source;
+	ops.read_block = compaction_read_failure;
+	st->readers[0]->source.ops = &ops;
+	st->readers[0]->source.arg = &hook;
+
+	/* Non-NULL expiry forces compaction even for a single table. */
+	err = reftable_stack_compact_all(st, &expiry);
+	EXPECT(hook.fired);
+	EXPECT(err == REFTABLE_IO_ERROR);
+	st->readers[0]->source = hook.original;
+	err = read_lines(st->list_file, &after);
+	EXPECT_ERR(err);
+	EXPECT(names_equal(before, after));
+	EXPECT(count_dir_entries(dir) == 2); /* Original table and manifest only. */
+
+	err = reftable_new_stack(&fresh, dir, cfg);
+	EXPECT_ERR(err);
+	for (i = 0; i < count; i++) {
+		char name[64];
+		struct reftable_ref_record ref = { NULL };
+		snprintf(name, sizeof(name), "refs/heads/branch%04d", i);
+		err = reftable_stack_read_ref(st, name, &ref);
+		EXPECT_ERR(err);
+		reftable_ref_record_release(&ref);
+		err = reftable_stack_read_ref(fresh, name, &ref);
+		EXPECT_ERR(err);
+		EXPECT(ref.update_index == 1);
+		reftable_ref_record_release(&ref);
+	}
+	free_names(before);
+	free_names(after);
+	reftable_stack_destroy(fresh);
+	reftable_stack_destroy(st);
+	clear_dir(dir);
+}
+
+static void test_reftable_stack_reload_failure_preserves_readers(void)
+{
+	char *dir = get_tmp_dir(__LINE__);
+	struct reftable_write_options cfg = { 0 };
+	struct reftable_stack *st = NULL;
+	struct reftable_ref_record ref = {
+		.refname = "HEAD",
+		.update_index = 1,
+		.value_type = REFTABLE_REF_SYMREF,
+		.value.symref = "refs/heads/main",
+	};
+	struct reftable_ref_record got = { NULL };
+	const char missing[] = "missing.ref\n";
+	int err, fd;
+
+	err = reftable_new_stack(&st, dir, cfg);
+	EXPECT_ERR(err);
+	err = reftable_stack_add(st, &write_test_ref, &ref);
+	EXPECT_ERR(err);
+	fd = open(st->list_file, O_WRONLY | O_APPEND);
+	EXPECT(fd >= 0);
+	EXPECT(write(fd, missing, sizeof(missing) - 1) == sizeof(missing) - 1);
+	EXPECT(close(fd) == 0);
+
+	err = reftable_stack_reload(st);
+	EXPECT(err == REFTABLE_NOT_EXIST_ERROR);
+	err = reftable_stack_read_ref(st, "HEAD", &got);
+	EXPECT_ERR(err);
+	EXPECT_STREQ(got.value.symref, "refs/heads/main");
+	reftable_ref_record_release(&got);
+	reftable_stack_destroy(st);
+	clear_dir(dir);
+}
+
+/* A contender that never owned the lock must not unlink it on failure. */
+static void test_reftable_stack_failed_addition_preserves_lock(void)
+{
+	char *dir = get_tmp_dir(__LINE__);
+	struct reftable_write_options cfg = { 0 };
+	struct reftable_stack *owner = NULL;
+	struct reftable_stack *contender = NULL;
+	struct reftable_addition *first = NULL;
+	struct reftable_addition *second = NULL;
+	struct strbuf lock = STRBUF_INIT;
+	int err, contender_err, lock_survived;
+
+	err = reftable_new_stack(&owner, dir, cfg);
+	EXPECT_ERR(err);
+	err = reftable_new_stack(&contender, dir, cfg);
+	EXPECT_ERR(err);
+	err = reftable_stack_new_addition(&first, owner);
+	EXPECT_ERR(err);
+	strbuf_addstr(&lock, dir);
+	strbuf_addstr(&lock, "/tables.list.lock");
+	EXPECT(access(lock.buf, F_OK) == 0);
+
+	contender_err = reftable_stack_new_addition(&second, contender);
+	lock_survived = access(lock.buf, F_OK) == 0;
+
+	reftable_addition_destroy(second);
+	reftable_addition_destroy(first);
+	reftable_stack_destroy(contender);
+	reftable_stack_destroy(owner);
+	strbuf_release(&lock);
+	clear_dir(dir);
+
+	EXPECT(contender_err == REFTABLE_LOCK_ERROR);
+	EXPECT(lock_survived);
 }
 
 static void test_reftable_stack_add(void)
@@ -936,6 +1196,10 @@ int stack_test_main(int argc, const char *argv[])
 	RUN_TEST(test_reftable_stack_compaction_concurrent_clean);
 	RUN_TEST(test_reftable_stack_hash_id);
 	RUN_TEST(test_reftable_stack_lock_failure);
+	RUN_TEST(test_reftable_stack_compaction_preserves_addition);
+	RUN_TEST(test_reftable_stack_compaction_preserves_read_error);
+	RUN_TEST(test_reftable_stack_failed_addition_preserves_lock);
+	RUN_TEST(test_reftable_stack_reload_failure_preserves_readers);
 	RUN_TEST(test_reftable_stack_log_normalize);
 	RUN_TEST(test_reftable_stack_tombstone);
 	RUN_TEST(test_reftable_stack_transaction_api);

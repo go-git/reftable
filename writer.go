@@ -86,13 +86,29 @@ func (cfg *Config) setDefaults() {
 func NewWriter(out io.Writer, cfg *Config) (*Writer, error) {
 	o := *cfg
 	o.setDefaults()
+
+	// Validate before allocating: BlockSize is caller-supplied, so checking
+	// after make() lets Config{BlockSize: 1<<30} reserve 1GiB and then fail.
+	if o.BlockSize >= (1 << 24) {
+		return nil, errors.New("reftable: invalid blocksize")
+	}
+	if o.HashID.Size() == 0 {
+		return nil, fmt.Errorf("reftable: unknown hash id %q", string(o.HashID[:]))
+	}
+	version := 1
+	if o.HashID == SHA256ID {
+		version = 2
+	}
+	// Reserve the file header, the four-byte block header, and the
+	// two-byte restart count before initializing the first block writer.
+	minimumBlockSize := uint32(headerSize(version) + 4 + 2)
+	if o.BlockSize < minimumBlockSize {
+		return nil, fmt.Errorf("reftable: block size %d is smaller than minimum %d", o.BlockSize, minimumBlockSize)
+	}
+
 	w := &Writer{
 		cfg:   o,
 		block: make([]byte, o.BlockSize),
-	}
-
-	if cfg.BlockSize >= (1 << 24) {
-		return nil, errors.New("reftable: invalid blocksize")
 	}
 
 	w.paddedWriter.out = out
@@ -485,12 +501,17 @@ func (w *Writer) finishSection() error {
 		threshold = 1
 	}
 	before := w.Stats.idxStats.Blocks
+	// Build index levels bottom-up. Each flushBlock appends an index record
+	// for the block it wrote, so w.index accumulates the next level up as we
+	// go. The loop stops once the top level is small enough for the reader to
+	// scan linearly (seekLinear walks across blocks), which is what threshold
+	// expresses.
 	for len(w.index) > threshold {
 		maxLevel++
 		indexStart = w.next
-		w.blockWriter = w.newBlockWriter(blockTypeIndex)
 		idx := w.index
 		w.index = nil
+		w.blockWriter = w.newBlockWriter(blockTypeIndex)
 		for _, i := range idx {
 			if w.blockWriter.add(&i) {
 				continue
@@ -504,11 +525,34 @@ func (w *Writer) finishSection() error {
 				panic("fail on fresh block")
 			}
 		}
+
+		// Flush this level's final, partial block. Without this the
+		// pending block is either silently discarded by the next
+		// iteration (losing every entry in it) or flushed after w.index
+		// has been cleared, leaving a stale record that is then written
+		// as the first entry of the *next* section's index.
+		if err := w.flushBlock(); err != nil {
+			return err
+		}
+
+		if len(w.index) >= len(idx) {
+			// The level did not shrink, so no further level can collapse
+			// it either: the keys are large enough that an index block
+			// holds a single entry. Stop instead of looping forever.
+			// See TestTableObjectIDLen for this shape.
+			break
+		}
 	}
+
+	// No flush is needed here. Every path above leaves w.blockWriter either
+	// nil or holding zero entries, and flushBlock returns early for both:
+	// each loop iteration ends by flushing its level, and the flush at the
+	// top of this function already handled the section's last data block.
+	//
+	// Drop the index. Its remaining records describe this section's own
+	// top-level index blocks; carrying them into the next section would
+	// write them as that section's first index entries.
 	w.index = nil
-	if err := w.flushBlock(); err != nil {
-		return err
-	}
 
 	blockStats := w.getBlockStats(typ)
 	blockStats.IndexBlocks = w.Stats.idxStats.Blocks - before

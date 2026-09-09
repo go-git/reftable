@@ -11,6 +11,7 @@ https://developers.google.com/open-source/licenses/bsd
 
 #include <stdint.h>
 #include <stdlib.h>
+#include <sys/types.h>
 
 /*
  * Provides a bounds-checked, growable byte ranges. To use, initialize as

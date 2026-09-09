@@ -198,6 +198,8 @@ static int reftable_stack_reload_once(struct reftable_stack *st, char **names,
 	struct reftable_reader **cur = stack_copy_readers(st, cur_len);
 	int err = 0;
 	int names_len = names_length(names);
+	char **retained_names = names;
+	int *borrowed = reftable_calloc(sizeof(int) * names_len);
 	struct reftable_reader **new_readers =
 		reftable_calloc(sizeof(struct reftable_reader *) * names_len);
 	struct reftable_table *new_tables =
@@ -216,6 +218,7 @@ static int reftable_stack_reload_once(struct reftable_stack *st, char **names,
 		for (j = 0; reuse_open && j < cur_len; j++) {
 			if (cur[j] && 0 == strcmp(cur[j]->name, name)) {
 				rd = cur[j];
+				borrowed[new_readers_len] = 1;
 				cur[j] = NULL;
 				break;
 			}
@@ -268,13 +271,15 @@ static int reftable_stack_reload_once(struct reftable_stack *st, char **names,
 		if (cur[i]) {
 			const char *name = reader_name(cur[i]);
 			struct strbuf filename = STRBUF_INIT;
-			stack_filename(&filename, st, name);
+			if (!has_name(retained_names, name))
+				stack_filename(&filename, st, name);
 
 			reader_close(cur[i]);
 			reftable_reader_free(cur[i]);
 
 			/* On Windows, can only unlink after closing. */
-			unlink(filename.buf);
+			if (filename.len)
+				unlink(filename.buf);
 
 			strbuf_release(&filename);
 		}
@@ -282,9 +287,10 @@ static int reftable_stack_reload_once(struct reftable_stack *st, char **names,
 
 done:
 	for (i = 0; i < new_readers_len; i++) {
-		reader_close(new_readers[i]);
-		reftable_reader_free(new_readers[i]);
+		if (!borrowed[i])
+			reftable_reader_free(new_readers[i]);
 	}
+	reftable_free(borrowed);
 	reftable_free(new_readers);
 	reftable_free(new_tables);
 	reftable_free(cur);
@@ -445,6 +451,7 @@ static void format_name(struct strbuf *dest, uint64_t min, uint64_t max)
 
 struct reftable_addition {
 	int lock_file_fd;
+	int have_lock;
 	struct strbuf lock_file_name;
 	struct reftable_stack *stack;
 
@@ -455,6 +462,7 @@ struct reftable_addition {
 
 #define REFTABLE_ADDITION_INIT                \
 	{                                     \
+		.lock_file_fd = -1,           \
 		.lock_file_name = STRBUF_INIT \
 	}
 
@@ -478,11 +486,12 @@ static int reftable_stack_init_addition(struct reftable_addition *add,
 		}
 		goto done;
 	}
+	add->have_lock = 1;
 	err = stack_uptodate(st);
 	if (err < 0)
 		goto done;
 
-	if (err > 1) {
+	if (err > 0) {
 		err = REFTABLE_LOCK_ERROR;
 		goto done;
 	}
@@ -509,14 +518,15 @@ static void reftable_addition_close(struct reftable_addition *add)
 	add->new_tables = NULL;
 	add->new_tables_len = 0;
 
-	if (add->lock_file_fd > 0) {
+	if (add->lock_file_fd >= 0) {
 		close(add->lock_file_fd);
-		add->lock_file_fd = 0;
+		add->lock_file_fd = -1;
 	}
-	if (add->lock_file_name.len > 0) {
+	if (add->have_lock) {
 		unlink(add->lock_file_name.buf);
-		strbuf_release(&add->lock_file_name);
+		add->have_lock = 0;
 	}
+	strbuf_release(&add->lock_file_name);
 
 	strbuf_release(&nm);
 }
@@ -555,7 +565,7 @@ int reftable_addition_commit(struct reftable_addition *add)
 	}
 
 	err = close(add->lock_file_fd);
-	add->lock_file_fd = 0;
+	add->lock_file_fd = -1;
 	if (err < 0) {
 		err = REFTABLE_IO_ERROR;
 		goto done;
@@ -568,6 +578,7 @@ int reftable_addition_commit(struct reftable_addition *add)
 	}
 
 	/* success, no more state to clean up. */
+	add->have_lock = 0;
 	strbuf_release(&add->lock_file_name);
 	for (i = 0; i < add->new_tables_len; i++) {
 		reftable_free(add->new_tables[i]);
@@ -818,6 +829,10 @@ static int stack_write_compact(struct reftable_stack *st,
 		}
 		entries++;
 	}
+	/* Do not overwrite a ref read/write error with a successful log seek:
+	 * publishing the partial output would permanently drop unread refs. */
+	if (err < 0)
+		goto done;
 	reftable_iterator_destroy(&it);
 
 	err = reftable_merged_table_seek_log(mt, &it, "");
@@ -880,6 +895,8 @@ static int stack_compact_range(struct reftable_stack *st, int first, int last,
 	int lock_file_fd = 0;
 	int compact_count = last - first + 1;
 	char **listp = NULL;
+	char **current_names = NULL;
+	int current_len = 0, replacement_start = -1;
 	char **delete_on_success =
 		reftable_calloc(sizeof(char *) * (compact_count + 1));
 	char **subtable_locks =
@@ -932,15 +949,13 @@ static int stack_compact_range(struct reftable_stack *st, int first, int last,
 
 		sublock_file_fd = open(subtab_lock.buf,
 				       O_EXCL | O_CREAT | O_WRONLY, 0644);
-		if (sublock_file_fd > 0) {
-			close(sublock_file_fd);
-		} else if (sublock_file_fd < 0) {
-			if (errno == EEXIST) {
-				err = 1;
-			} else {
-				err = REFTABLE_IO_ERROR;
-			}
+		if (sublock_file_fd < 0) {
+			err = errno == EEXIST ? 1 : REFTABLE_IO_ERROR;
+			strbuf_release(&subtab_lock);
+			strbuf_release(&subtab_file_name);
+			goto done;
 		}
+		close(sublock_file_fd);
 
 		subtable_locks[j] = subtab_lock.buf;
 		delete_on_success[j] = subtab_file_name.buf;
@@ -978,6 +993,27 @@ static int stack_compact_range(struct reftable_stack *st, int first, int last,
 	}
 	have_lock = 1;
 
+	/* Preserve changes committed while we did not hold the global lock. */
+	err = read_lines(st->list_file, &current_names);
+	if (err < 0)
+		goto done;
+	current_len = names_length(current_names);
+	for (i = 0; i + compact_count <= current_len; i++) {
+		for (j = 0; j < compact_count; j++) {
+			if (strcmp(current_names[i + j],
+				   st->readers[first + j]->name))
+				break;
+		}
+		if (j == compact_count) {
+			replacement_start = i;
+			break;
+		}
+	}
+	if (replacement_start < 0) {
+		err = 1;
+		goto done;
+	}
+
 	format_name(&new_table_name, st->readers[first]->min_update_index,
 		    st->readers[last]->max_update_index);
 	strbuf_addstr(&new_table_name, ".ref");
@@ -993,16 +1029,16 @@ static int stack_compact_range(struct reftable_stack *st, int first, int last,
 		}
 	}
 
-	for (i = 0; i < first; i++) {
-		strbuf_addstr(&ref_list_contents, st->readers[i]->name);
+	for (i = 0; i < replacement_start; i++) {
+		strbuf_addstr(&ref_list_contents, current_names[i]);
 		strbuf_addstr(&ref_list_contents, "\n");
 	}
 	if (!is_empty_table) {
 		strbuf_addbuf(&ref_list_contents, &new_table_name);
 		strbuf_addstr(&ref_list_contents, "\n");
 	}
-	for (i = last + 1; i < st->merged->stack_len; i++) {
-		strbuf_addstr(&ref_list_contents, st->readers[i]->name);
+	for (i = replacement_start + compact_count; i < current_len; i++) {
+		strbuf_addstr(&ref_list_contents, current_names[i]);
 		strbuf_addstr(&ref_list_contents, "\n");
 	}
 
@@ -1042,6 +1078,9 @@ static int stack_compact_range(struct reftable_stack *st, int first, int last,
 	}
 
 done:
+	free_names(current_names);
+	if (temp_tab_file_name.len)
+		unlink(temp_tab_file_name.buf);
 	free_names(delete_on_success);
 
 	listp = subtable_locks;

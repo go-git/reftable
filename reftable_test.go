@@ -405,7 +405,9 @@ func TestTableIterRefLevel0(t *testing.T) {
 func TestTableSeekLogLevel1(t *testing.T) {
 	// 25 * (50b + 60b) -> 13 blocks
 	// 13 blocks -> 3 index blocks; not enough for another index level
-	testTableSeek(t, blockTypeLog, 25, 50, 256, 1, false)
+	// 25 records needs two index levels now that every level's final block
+	// is flushed; 7..20 records is the single-level band for this shape.
+	testTableSeek(t, blockTypeLog, 20, 50, 256, 1, false)
 }
 
 func TestTableLogBlocksUnaligned(t *testing.T) {

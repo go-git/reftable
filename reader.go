@@ -166,11 +166,17 @@ func NewReader(src BlockSource, name string) (*Reader, error) {
 		return nil, err
 	}
 
+	// The hash ID is 4 raw bytes out of the file. Validate it before use:
+	// this runs before the CRC is compared below, so an unknown value here
+	// is reachable with no valid checksum at all.
 	r.hashSize = r.header.HashID.Size()
+	if r.hashSize == 0 {
+		return nil, fmt.Errorf("%w: unknown hash id %q", fmtError, string(r.header.HashID[:]))
+	}
 	r.header.BlockSize &= (1 << 24) - 1
 
 	if footBuf.Len() > 0 {
-		log.Panicf("footer size %d", footBuf.Len())
+		return nil, fmt.Errorf("%w: trailing footer bytes: %d", fmtError, footBuf.Len())
 	}
 
 	r.objectIDLen = int(r.footer.ObjOffset & ((1 << 5) - 1))
@@ -231,7 +237,7 @@ func (i *tableIter) nextInBlock(rec record) (bool, error) {
 		}
 	}
 	if err != nil {
-		err = fmt.Errorf("block %c, off %d: %v", i.typ, i.blockOff, err)
+		err = fmt.Errorf("block %c, off %d: %w", i.typ, i.blockOff, err)
 	}
 	return ok, err
 }
@@ -264,10 +270,13 @@ func (i *tableIter) Next(rec record) (bool, error) {
 // extractBlockSize returns the block size from the block header
 func extractBlockSize(block []byte, off uint64, version int) (typ byte, size uint32, err error) {
 	if off == 0 {
+		if len(block) < headerSize(version) {
+			return 0, 0, fmtError
+		}
 		block = block[headerSize(version):]
 	}
 
-	if !isBlockType(block[0]) {
+	if len(block) < 4 || !isBlockType(block[0]) {
 		return 0, 0, fmtError
 	}
 
@@ -334,7 +343,7 @@ func (i *tableIter) nextBlock() (bool, error) {
 	nextBlockOff := i.blockOff + uint64(i.bi.br.fullBlockSize)
 	br, err := i.r.newBlockReader(nextBlockOff, i.typ)
 	if err != nil {
-		return false, fmt.Errorf("reftable: reading %c block at 0x%x: %v", i.typ, nextBlockOff, err)
+		return false, fmt.Errorf("reftable: reading %c block at 0x%x: %w", i.typ, nextBlockOff, err)
 	}
 	if br == nil {
 		i.finished = true
@@ -429,6 +438,11 @@ func (r *Reader) seek(rec record) (*tableIter, error) {
 	if err != nil {
 		return nil, err
 	}
+	if tabIter == nil {
+		// No block of this type at the recorded offset; seekRecord turns a
+		// nil iterator into an empty one.
+		return nil, nil
+	}
 
 	ok, err := r.seekLinear(tabIter, rec)
 	if ok {
@@ -448,28 +462,50 @@ func (r *Reader) seekIndexed(want record) (*tableIter, error) {
 		LastKey: want.key(),
 	}
 
+	// seekIndexed is only reached when IndexOffset is non-zero, so a nil
+	// iterator here means that offset does not address an index block.
+	if idxIter == nil {
+		return nil, fmt.Errorf("%w: index offset %d does not address an index block",
+			fmtError, r.offsets[want.typ()].IndexOffset)
+	}
+
 	ok, err := r.seekLinear(idxIter, wantIdx)
 	if err != nil || !ok {
 		return nil, err
 	}
 
-	for {
+	// Every offset below is read out of the file, so each descent can be made
+	// to point anywhere, including back at the block we came from. Bound the
+	// walk: a real index tree has a handful of levels, since each one holds
+	// strictly fewer blocks than the level beneath it.
+	for depth := 0; ; depth++ {
+		if depth > maxIndexDepth {
+			return nil, fmt.Errorf("%w: index deeper than %d levels, probably cyclic",
+				fmtError, maxIndexDepth)
+		}
+
 		var rec indexRecord
 		ok, err := idxIter.Next(&rec)
-		if !ok {
-			return nil, nil
-		}
 		if err != nil {
 			return nil, err
+		}
+		if !ok {
+			return nil, nil
 		}
 
 		tabIter, err := r.tabIterAt(rec.Offset, blockTypeAny)
 		if err != nil {
 			return nil, err
 		}
+		if tabIter == nil {
+			// tabIterAt returns (nil, nil) when the offset is past EOF or
+			// otherwise unusable. The offset came from the file, so this is
+			// malformed input, not an empty result.
+			return nil, fmt.Errorf("%w: index entry points at offset %d, which is not a block",
+				fmtError, rec.Offset)
+		}
 
-		err = tabIter.bi.seek(want.key())
-		if err != nil {
+		if err := tabIter.bi.seek(want.key()); err != nil {
 			return nil, err
 		}
 
@@ -478,7 +514,8 @@ func (r *Reader) seekIndexed(want record) (*tableIter, error) {
 		}
 
 		if tabIter.typ != blockTypeIndex {
-			log.Panicf("got type %c following indexes", tabIter.typ)
+			return nil, fmt.Errorf("%w: index entry at offset %d has block type %c, want %c or %c",
+				fmtError, rec.Offset, tabIter.typ, want.typ(), blockTypeIndex)
 		}
 
 		idxIter = tabIter
@@ -509,7 +546,8 @@ func (r *Reader) seekLinear(tabIter *tableIter, want record) (bool, error) {
 			return false, err
 		}
 		if !ok {
-			panic("read from fresh block failed")
+			return false, fmt.Errorf("%w: block at offset %d yielded no records",
+				fmtError, tabIter.blockOff)
 		}
 		if rec.key() > wantKey {
 			break
@@ -590,6 +628,7 @@ func (i *indexedTableRefIter) Next(rec record) (bool, error) {
 		}
 
 		if bytes.Compare(ref.Value, i.oid) == 0 || bytes.Compare(ref.TargetValue, i.oid) == 0 {
+			ref.UpdateIndex += i.r.header.MinUpdateIndex
 			return true, nil
 		}
 	}
@@ -605,6 +644,9 @@ func (r *Reader) RefsFor(oid []byte) (*Iterator, error) {
 	if err != nil {
 		return nil, err
 	}
+	if it == nil {
+		return &Iterator{&emptyIterator{}}, nil
+	}
 	return &Iterator{&filteringRefIterator{
 		tab:         r,
 		oid:         oid,
@@ -614,11 +656,20 @@ func (r *Reader) RefsFor(oid []byte) (*Iterator, error) {
 }
 
 func (r *Reader) refsForIndexed(oid []byte) (*Iterator, error) {
+	// objectIDLen comes from the footer and can exceed the hash the caller
+	// passed, e.g. a 20 byte SHA-1 against a table declaring 31.
+	if r.objectIDLen > len(oid) {
+		return nil, fmt.Errorf("%w: table declares object id length %d, got a %d byte id",
+			fmtError, r.objectIDLen, len(oid))
+	}
 	want := &objRecord{HashPrefix: oid[:r.objectIDLen]}
 
 	it, err := r.seek(want)
 	if err != nil {
 		return nil, err
+	}
+	if it == nil {
+		return &Iterator{&emptyIterator{}}, nil
 	}
 
 	got := objRecord{}
